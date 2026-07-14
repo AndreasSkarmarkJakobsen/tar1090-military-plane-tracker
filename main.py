@@ -91,7 +91,7 @@ USER_AGENT_STRING = f"MilitaryAircraftTracker/1.1 (+{CONTACT_INFO})"
 TEST_HEX = os.getenv("TEST_HEX", "")
 
 tracked_aircraft_cache = {}
-COOLDOWN_WINDOW = int(os.getenv("COOLDOWN_WINDOW", "600"))  # 10 minutes in seconds
+COOLDOWN_WINDOW = int(os.getenv("COOLDOWN_WINDOW", "600"))
 
 
 def http_get_json(url, headers=None, timeout=5, log_errors=True):
@@ -332,6 +332,27 @@ def is_military(aircraft):
     return False
 
 
+def is_adsb_tracked(aircraft):
+    if not isinstance(aircraft, dict):
+        return False
+
+    if aircraft.get("mlat") or aircraft.get("tisb"):
+        return False
+
+    if "adsb" in aircraft:
+        adsb_value = aircraft.get("adsb")
+        if isinstance(adsb_value, bool):
+            return adsb_value
+        if isinstance(adsb_value, str):
+            normalized = adsb_value.strip().lower()
+            return normalized in {"true", "1", "yes", "y"}
+
+    return any(
+        aircraft.get(field) is not None
+        for field in ("lat", "lon", "alt_baro", "alt_geom")
+    )
+
+
 def query_planespotters_endpoint(url):
     headers = {
         "User-Agent": USER_AGENT_STRING,
@@ -461,7 +482,14 @@ def main():
             for aircraft in aircraft_list:
                 hex_code = aircraft.get("hex")
 
-                if hex_code and is_military(aircraft):
+                if not hex_code:
+                    continue
+
+                if not is_adsb_tracked(aircraft):
+                    log.debug(f"Skipping non-ADS-B aircraft: {hex_code}")
+                    continue
+
+                if is_military(aircraft):
                     if hex_code not in tracked_aircraft_cache:
                         initial_reg = aircraft.get("r") or get_registration_from_tar1090_db(hex_code) or "Unknown"
                         photo_details, resolved_reg = get_aircraft_photo(hex_code, initial_reg)
