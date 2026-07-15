@@ -124,6 +124,32 @@ def http_get_json(url, headers=None, timeout=5, log_errors=True):
     return None
 
 
+def http_get_text(url, headers=None, timeout=5, log_errors=True):
+    request_headers = {"Accept": "*/*"}
+    if headers:
+        request_headers.update(headers)
+
+    try:
+        request = Request(url, headers=request_headers, method="GET")
+        with get_http_opener().open(request, timeout=timeout) as response:
+            raw_bytes = response.read()
+            content_encoding = str(response.headers.get("Content-Encoding", "")).lower()
+            if "gzip" in content_encoding or raw_bytes.startswith(b"\x1f\x8b"):
+                try:
+                    raw_bytes = gzip.decompress(raw_bytes)
+                except OSError:
+                    if log_errors:
+                        log.warning(f"Failed to decompress gzip response for {url}")
+            return raw_bytes.decode("utf-8")
+    except HTTPError as exc:
+        if log_errors:
+            log.warning(f"HTTP error {exc.code} while fetching {url}")
+    except URLError as exc:
+        if log_errors:
+            log.error(f"Error communicating with {url}: {exc}")
+    return None
+
+
 def http_post_json(url, payload, headers=None, timeout=5):
     request_headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if headers:
@@ -233,6 +259,53 @@ def get_tar1090_military_ranges():
     return ranges
 
 
+@lru_cache(maxsize=1)
+def get_tar1090_type_descriptions():
+    data = http_get_json(f"{TAR1090_DB_FOLDER}/icao_aircraft_types2.js", timeout=10, log_errors=False)
+    return data if isinstance(data, dict) else {}
+
+
+@lru_cache(maxsize=1)
+def get_flags_js_url():
+    html = http_get_text(f"{BASE_URL}/", timeout=10, log_errors=False)
+    if not html:
+        return None
+    match = re.search(r'flags_[a-f0-9]+\.js', html)
+    if not match:
+        return None
+    return f"{BASE_URL}/{match.group(0)}"
+
+
+_ICAO_RANGE_ENTRY_RE = re.compile(
+    r"start:\s*0x([0-9A-Fa-f]+)\s*,\s*end:\s*0x([0-9A-Fa-f]+)\s*,\s*country:\s*\"([^\"]*)\""
+)
+
+
+@lru_cache(maxsize=1)
+def get_tar1090_country_ranges():
+    flags_url = get_flags_js_url()
+    if not flags_url:
+        log.debug("Could not locate flags_*.js on tar1090 root page")
+        return []
+
+    raw = http_get_text(flags_url, timeout=10, log_errors=False)
+    if not raw:
+        return []
+
+    ranges = []
+    for match in _ICAO_RANGE_ENTRY_RE.finditer(raw):
+        start_hex, end_hex, country = match.groups()
+        try:
+            ranges.append((int(start_hex, 16), int(end_hex, 16), country))
+        except ValueError:
+            continue
+
+    if not ranges:
+        log.debug(f"Could not extract any ICAO_Ranges entries from {flags_url}")
+
+    return ranges
+
+
 @lru_cache(maxsize=256)
 def get_tar1090_db_record(hex_code):
     query_hex = str(hex_code).strip().upper()
@@ -285,6 +358,52 @@ def get_registration_from_tar1090_db(hex_code):
 
     registration = str(db_record[0]).strip()
     return registration or None
+
+
+def get_callsign(aircraft):
+    flight = aircraft.get("flight")
+    if flight:
+        cleaned = str(flight).strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
+def get_aircraft_model(aircraft):
+    hex_code = aircraft.get("hex", "")
+    db_record = get_tar1090_db_record(str(hex_code).strip().upper())
+
+    if isinstance(db_record, (list, tuple)) and len(db_record) >= 4 and db_record[3]:
+        return str(db_record[3])
+
+    type_code = aircraft.get("t")
+    if not type_code and isinstance(db_record, (list, tuple)) and len(db_record) >= 2:
+        type_code = db_record[1]
+
+    if type_code:
+        entry = get_tar1090_type_descriptions().get(str(type_code).strip().upper())
+        if isinstance(entry, (list, tuple)) and entry:
+            name = entry[0]
+            if name:
+                return str(name)
+
+    desc = aircraft.get("desc")
+    if desc:
+        return str(desc)
+
+    return str(type_code) if type_code else "Unknown Model"
+
+
+def get_aircraft_country(hex_code):
+    try:
+        numeric_hex = int(str(hex_code).strip().upper(), 16)
+    except ValueError:
+        return None
+
+    for start_val, end_val, country in get_tar1090_country_ranges():
+        if start_val <= numeric_hex <= end_val:
+            return country
+    return None
 
 
 def is_military(aircraft):
@@ -405,7 +524,9 @@ def get_aircraft_photo(hex_code, registration):
 def send_webhook(aircraft, registration, photo_details):
     hex_code = aircraft.get("hex", "")
     flight_link = f"{BASE_URL}/?icao={hex_code}" if hex_code else BASE_URL
-    display_reg = registration if registration else str(hex_code).upper()
+
+    callsign = get_callsign(aircraft)
+    display_reg = callsign or registration or str(hex_code).upper()
 
     photo_url = photo_details.get("image_url") if photo_details else None
 
@@ -415,11 +536,17 @@ def send_webhook(aircraft, registration, photo_details):
         p_url = photo_details.get("photo_page")
         attribution_text = f"\n\n*Photo by [{p_name}]({p_url}) via Planespotters.net*"
 
-    if str(hex_code).strip().lower() == str(TEST_HEX).strip().lower():
+    is_test = str(hex_code).strip().lower() == str(TEST_HEX).strip().lower()
+
+    model = get_aircraft_model(aircraft)
+    altitude = aircraft.get("alt_baro", aircraft.get("alt_geom", "Unknown Altitude"))
+    country = get_aircraft_country(hex_code) or "Unknown"
+
+    if is_test:
         description_text = (
-            "**TESTING:** TESTING\n"
-            "**TESTING:** TESTING\n"
-            "**TESTING:** TESTING\n\n"
+            f"**Model:** {model} (TESTING)\n"
+            f"**Altitude:** {altitude} ft (TESTING)\n"
+            f"**Country of Registration:** {country} (TESTING)\n\n"
             f"[take me to the flight]({flight_link})"
             f"{attribution_text}"
         )
@@ -427,17 +554,13 @@ def send_webhook(aircraft, registration, photo_details):
             "content": "TESTING",
             "embeds": [
                 {
-                    "title": "TESTING",
+                    "title": f"Military Plane Detected: {display_reg} (TESTING)",
                     "description": description_text,
                     "image": {"url": photo_url} if photo_url else {},
                 }
             ],
         }
     else:
-        model = aircraft.get("desc", aircraft.get("t", "Unknown Model"))
-        altitude = aircraft.get("alt_baro", aircraft.get("alt_geom", "Unknown Altitude"))
-        country = aircraft.get("country", "Unknown")
-
         description_text = (
             f"**Model:** {model}\n"
             f"**Altitude:** {altitude} ft\n"
