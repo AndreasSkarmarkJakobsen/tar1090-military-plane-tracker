@@ -5,10 +5,15 @@ import re
 import ssl
 import time
 import logging
+import threading
+from datetime import datetime, timezone
+from email.utils import format_datetime
 from functools import lru_cache
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
+from xml.etree import ElementTree as ET
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 log = logging.getLogger("mil-watch")
@@ -81,9 +86,20 @@ def get_http_opener():
 
 BASE_URL = os.getenv("BASE_URL", "https://track.example.com").rstrip("/")
 TAR1090_URL = os.getenv("TAR1090_URL", f"{BASE_URL}/data/aircraft.json")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://example.com/webhook")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "15"))
 TAR1090_DB_FOLDER = f"{BASE_URL}/db-22f6339"
+
+DEFAULT_RSS_FEED_PATH = Path(__file__).resolve().parent / "military-feed.xml"
+RSS_FEED_PATH = Path(os.getenv("RSS_FEED_PATH", str(DEFAULT_RSS_FEED_PATH)))
+RSS_FEED_TITLE = os.getenv("RSS_FEED_TITLE", "Military Aircraft Tracker")
+RSS_FEED_LINK = os.getenv("RSS_FEED_LINK", BASE_URL)
+RSS_FEED_DESCRIPTION = os.getenv(
+    "RSS_FEED_DESCRIPTION", "Detected military aircraft from tar1090 feed"
+)
+RSS_MAX_ITEMS = int(os.getenv("RSS_MAX_ITEMS", "100"))
+RSS_HOST = os.getenv("RSS_HOST", "0.0.0.0")
+RSS_PORT = int(os.getenv("RSS_PORT", "8787"))
+RSS_ROUTE = os.getenv("RSS_ROUTE", "/feed.xml")
 
 CONTACT_INFO = os.getenv("CONTACT_INFO", "your-email@example.com")
 USER_AGENT_STRING = f"MilitaryAircraftTracker/1.1 (+{CONTACT_INFO})"
@@ -148,24 +164,6 @@ def http_get_text(url, headers=None, timeout=5, log_errors=True):
         if log_errors:
             log.error(f"Error communicating with {url}: {exc}")
     return None
-
-
-def http_post_json(url, payload, headers=None, timeout=5):
-    request_headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    if headers:
-        request_headers.update(headers)
-
-    data = json.dumps(payload).encode("utf-8")
-    try:
-        request = Request(url, data=data, headers=request_headers, method="POST")
-        with get_http_opener().open(request, timeout=timeout) as response:
-            response.read()
-            return True
-    except HTTPError as exc:
-        log.warning(f"Webhook returned HTTP status {exc.code} for {url}")
-    except URLError as exc:
-        log.error(f"Failed to send webhook to {url}: {exc}")
-    return False
 
 
 def get_registration_from_public_api(hex_code):
@@ -521,7 +519,72 @@ def get_aircraft_photo(hex_code, registration):
     return None, registration
 
 
-def send_webhook(aircraft, registration, photo_details):
+def load_or_create_rss_channel():
+    if RSS_FEED_PATH.exists():
+        try:
+            tree = ET.parse(RSS_FEED_PATH)
+            root = tree.getroot()
+            channel = root.find("channel")
+            if root.tag == "rss" and channel is not None:
+                return tree, root, channel
+            log.warning(f"RSS file at {RSS_FEED_PATH} is invalid. Recreating feed.")
+        except ET.ParseError:
+            log.warning(f"Could not parse existing RSS file at {RSS_FEED_PATH}. Recreating feed.")
+
+    root = ET.Element("rss", version="2.0")
+    channel = ET.SubElement(root, "channel")
+    ET.SubElement(channel, "title").text = RSS_FEED_TITLE
+    ET.SubElement(channel, "link").text = RSS_FEED_LINK
+    ET.SubElement(channel, "description").text = RSS_FEED_DESCRIPTION
+    ET.SubElement(channel, "lastBuildDate").text = format_datetime(datetime.now(timezone.utc), usegmt=True)
+    return ET.ElementTree(root), root, channel
+
+
+def init_rss_feed_file():
+    if RSS_FEED_PATH.exists():
+        return
+
+    tree, _, _ = load_or_create_rss_channel()
+    RSS_FEED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tree.write(RSS_FEED_PATH, encoding="utf-8", xml_declaration=True)
+
+
+def start_rss_http_server():
+    normalized_route = RSS_ROUTE if RSS_ROUTE.startswith("/") else f"/{RSS_ROUTE}"
+
+    class RSSHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path in {normalized_route, "/"}:
+                if not RSS_FEED_PATH.exists():
+                    self.send_error(404, "RSS feed not found")
+                    return
+
+                try:
+                    payload = RSS_FEED_PATH.read_bytes()
+                except OSError as exc:
+                    self.send_error(500, f"Could not read RSS feed: {exc}")
+                    return
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/rss+xml; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+
+            self.send_error(404, "Not Found")
+
+        def log_message(self, fmt, *args):
+            log.debug(f"RSS server: {fmt % args}")
+
+    server = ThreadingHTTPServer((RSS_HOST, RSS_PORT), RSSHandler)
+    thread = threading.Thread(target=server.serve_forever, name="rss-http-server", daemon=True)
+    thread.start()
+    log.info(f"RSS feed available at http://{RSS_HOST}:{RSS_PORT}{normalized_route}")
+    return server
+
+
+def write_rss_item(aircraft, registration, photo_details):
     hex_code = aircraft.get("hex", "")
     flight_link = f"{BASE_URL}/?icao={hex_code}" if hex_code else BASE_URL
 
@@ -542,50 +605,53 @@ def send_webhook(aircraft, registration, photo_details):
     altitude = aircraft.get("alt_baro", aircraft.get("alt_geom", "Unknown Altitude"))
     country = get_aircraft_country(hex_code) or "Unknown"
 
-    if is_test:
-        description_text = (
-            f"**Model:** {model} (TESTING)\n"
-            f"**Altitude:** {altitude} ft (TESTING)\n"
-            f"**Country of Registration:** {country} (TESTING)\n\n"
-            f"[take me to the flight]({flight_link})"
-            f"{attribution_text}"
-        )
-        payload = {
-            "content": "TESTING",
-            "embeds": [
-                {
-                    "title": f"Military Plane Detected: {display_reg} (TESTING)",
-                    "description": description_text,
-                    "image": {"url": photo_url} if photo_url else {},
-                }
-            ],
-        }
-    else:
-        description_text = (
-            f"**Model:** {model}\n"
-            f"**Altitude:** {altitude} ft\n"
-            f"**Country of Registration:** {country}\n\n"
-            f"[take me to the flight]({flight_link})"
-            f"{attribution_text}"
-        )
-        payload = {
-            "content": "Military Aircraft Detected",
-            "embeds": [
-                {
-                    "title": f"Military Plane Detected: {display_reg}",
-                    "description": description_text,
-                    "image": {"url": photo_url} if photo_url else {},
-                }
-            ],
-        }
+    tree, _, channel = load_or_create_rss_channel()
 
-    if http_post_json(WEBHOOK_URL, payload, timeout=5):
-        log.info(f"Webhook successfully sent for hex: {hex_code}")
+    if is_test:
+        title_text = f"Military Plane Detected: {display_reg} (TESTING)"
+        description_text = (
+            f"Model: {model} (TESTING)\n"
+            f"Altitude: {altitude} ft (TESTING)\n"
+            f"Country of Registration: {country} (TESTING)\n"
+            f"Flight Link: {flight_link}"
+        )
     else:
-        log.error(f"Failed to send webhook for hex {hex_code}")
+        title_text = f"Military Plane Detected: {display_reg}"
+        description_text = (
+            f"Model: {model}\n"
+            f"Altitude: {altitude} ft\n"
+            f"Country of Registration: {country}\n"
+            f"Flight Link: {flight_link}"
+        )
+
+    if attribution_text:
+        description_text += attribution_text.replace("\n\n", "\n")
+
+    item = ET.SubElement(channel, "item")
+    ET.SubElement(item, "title").text = title_text
+    ET.SubElement(item, "link").text = flight_link
+    ET.SubElement(item, "guid").text = f"{str(hex_code).lower()}-{int(time.time())}"
+    ET.SubElement(item, "pubDate").text = format_datetime(datetime.now(timezone.utc), usegmt=True)
+    ET.SubElement(item, "description").text = description_text
+
+    if photo_url:
+        ET.SubElement(item, "enclosure", url=photo_url, type="image/jpeg")
+
+    existing_items = channel.findall("item")
+    if len(existing_items) > RSS_MAX_ITEMS:
+        for stale_item in existing_items[:-RSS_MAX_ITEMS]:
+            channel.remove(stale_item)
+
+    channel.find("lastBuildDate").text = format_datetime(datetime.now(timezone.utc), usegmt=True)
+
+    RSS_FEED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tree.write(RSS_FEED_PATH, encoding="utf-8", xml_declaration=True)
+    log.info(f"RSS item written for hex {hex_code} -> {RSS_FEED_PATH}")
 
 
 def main():
+    init_rss_feed_file()
+    start_rss_http_server()
     log.info("Starting military aircraft tracker...")
     while True:
         current_time = time.time()
@@ -616,7 +682,7 @@ def main():
                     if hex_code not in tracked_aircraft_cache:
                         initial_reg = aircraft.get("r") or get_registration_from_tar1090_db(hex_code) or "Unknown"
                         photo_details, resolved_reg = get_aircraft_photo(hex_code, initial_reg)
-                        send_webhook(aircraft, resolved_reg, photo_details)
+                        write_rss_item(aircraft, resolved_reg, photo_details)
 
                     tracked_aircraft_cache[hex_code] = current_time + COOLDOWN_WINDOW
 
