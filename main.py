@@ -1,17 +1,19 @@
 import gzip
 import json
+import logging
 import os
 import re
 import ssl
-import time
-import logging
 import threading
+import time
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from functools import lru_cache
+from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urljoin
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 from xml.etree import ElementTree as ET
 
@@ -67,27 +69,22 @@ else:
     SSL_CONTEXT = ssl.create_default_context()
 
 
-def clear_proxy_environment():
-    for key in (
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-    ):
-        os.environ.pop(key, None)
+def build_ssl_context(disable_verify=False):
+    if disable_verify:
+        return ssl._create_unverified_context()
+    if SSL_CERT_PATH:
+        return ssl.create_default_context(cafile=SSL_CERT_PATH)
+    return ssl.create_default_context()
 
 
-def get_http_opener():
-    clear_proxy_environment()
-    return build_opener(ProxyHandler({}), HTTPSHandler(context=SSL_CONTEXT))
+def get_http_opener(ssl_context=None):
+    return build_opener(ProxyHandler({}), HTTPSHandler(context=ssl_context or SSL_CONTEXT))
 
 
 BASE_URL = os.getenv("BASE_URL", "https://track.example.com").rstrip("/")
 TAR1090_URL = os.getenv("TAR1090_URL", f"{BASE_URL}/data/aircraft.json")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "15"))
-TAR1090_DB_FOLDER = f"{BASE_URL}/db-22f6339"
+TAR1090_DB_FOLDER = None
 
 DEFAULT_RSS_FEED_PATH = Path(__file__).resolve().parent / "military-feed.xml"
 RSS_FEED_PATH = Path(os.getenv("RSS_FEED_PATH", str(DEFAULT_RSS_FEED_PATH)))
@@ -100,24 +97,34 @@ RSS_MAX_ITEMS = int(os.getenv("RSS_MAX_ITEMS", "100"))
 RSS_HOST = os.getenv("RSS_HOST", "0.0.0.0")
 RSS_PORT = int(os.getenv("RSS_PORT", "8787"))
 RSS_ROUTE = os.getenv("RSS_ROUTE", "/feed.xml")
+ENABLE_RSS = os.getenv("ENABLE_RSS", "true").strip().lower() in {"1", "true", "yes", "y"}
 
 CONTACT_INFO = os.getenv("CONTACT_INFO", "your-email@example.com")
-USER_AGENT_STRING = f"MilitaryAircraftTracker/1.1 (+{CONTACT_INFO})"
+USER_AGENT_STRING = f"MilitaryAircraftTracker/1.3 (+{CONTACT_INFO})"
 
 TEST_HEX = os.getenv("TEST_HEX", "")
-
-tracked_aircraft_cache = {}
 COOLDOWN_WINDOW = int(os.getenv("COOLDOWN_WINDOW", "600"))
 
+MATRIX_HOMESERVER = os.getenv("MATRIX_HOMESERVER", "").rstrip("/")
+MATRIX_ACCESS_TOKEN = os.getenv("MATRIX_ACCESS_TOKEN", "")
+MATRIX_ROOM_ID = os.getenv("MATRIX_ROOM_ID", "")
+MATRIX_MESSAGE_TYPE = os.getenv("MATRIX_MESSAGE_TYPE", "html").strip().lower()
+MATRIX_DISABLE_TLS_VERIFY = os.getenv("MATRIX_DISABLE_TLS_VERIFY", "false").strip().lower() in {
+    "1", "true", "yes", "y"
+}
+ENABLE_MATRIX = os.getenv("ENABLE_MATRIX", "true").strip().lower() in {"1", "true", "yes", "y"}
 
-def http_get_json(url, headers=None, timeout=5, log_errors=True):
+tracked_aircraft_cache = {}
+
+
+def http_get_json(url, headers=None, timeout=5, log_errors=True, ssl_context=None):
     request_headers = {"Accept": "application/json"}
     if headers:
         request_headers.update(headers)
 
     try:
         request = Request(url, headers=request_headers, method="GET")
-        with get_http_opener().open(request, timeout=timeout) as response:
+        with get_http_opener(ssl_context=ssl_context).open(request, timeout=timeout) as response:
             raw_bytes = response.read()
             content_encoding = str(response.headers.get("Content-Encoding", "")).lower()
             if "gzip" in content_encoding or raw_bytes.startswith(b"\x1f\x8b"):
@@ -140,14 +147,14 @@ def http_get_json(url, headers=None, timeout=5, log_errors=True):
     return None
 
 
-def http_get_text(url, headers=None, timeout=5, log_errors=True):
+def http_get_text(url, headers=None, timeout=5, log_errors=True, ssl_context=None):
     request_headers = {"Accept": "*/*"}
     if headers:
         request_headers.update(headers)
 
     try:
         request = Request(url, headers=request_headers, method="GET")
-        with get_http_opener().open(request, timeout=timeout) as response:
+        with get_http_opener(ssl_context=ssl_context).open(request, timeout=timeout) as response:
             raw_bytes = response.read()
             content_encoding = str(response.headers.get("Content-Encoding", "")).lower()
             if "gzip" in content_encoding or raw_bytes.startswith(b"\x1f\x8b"):
@@ -166,6 +173,108 @@ def http_get_text(url, headers=None, timeout=5, log_errors=True):
     return None
 
 
+def http_get_bytes(url, headers=None, timeout=10, log_errors=True, ssl_context=None):
+    request_headers = {"Accept": "*/*"}
+    if headers:
+        request_headers.update(headers)
+
+    try:
+        request = Request(url, headers=request_headers, method="GET")
+        with get_http_opener(ssl_context=ssl_context).open(request, timeout=timeout) as response:
+            raw_bytes = response.read()
+            content_encoding = str(response.headers.get("Content-Encoding", "")).lower()
+            if "gzip" in content_encoding or raw_bytes.startswith(b"\x1f\x8b"):
+                try:
+                    raw_bytes = gzip.decompress(raw_bytes)
+                except OSError:
+                    if log_errors:
+                        log.warning(f"Failed to decompress gzip response for {url}")
+
+            return {
+                "content": raw_bytes,
+                "content_type": response.headers.get("Content-Type", "application/octet-stream"),
+                "content_length": len(raw_bytes),
+            }
+    except HTTPError as exc:
+        if log_errors:
+            log.warning(f"HTTP error {exc.code} while fetching bytes from {url}")
+    except URLError as exc:
+        if log_errors:
+            log.error(f"Error communicating with {url}: {exc}")
+    return None
+
+
+def normalize_base_url(url):
+    return str(url).strip().rstrip("/")
+
+
+def extract_db_folder_from_html(html, base_url):
+    if not html:
+        return None
+
+    candidates = set()
+
+    patterns = [
+        r'["\']([^"\']*db-[a-zA-Z0-9]+(?:/[^"\']*)?)["\']',
+        r'["\']([^"\']*/db/[^"\']*)["\']',
+        r'\b(db-[a-zA-Z0-9]+)\b',
+    ]
+
+    for pattern in patterns:
+        for match in re.findall(pattern, html):
+            candidate = str(match).strip()
+            if not candidate:
+                continue
+
+            db_match = re.search(r'(.*/db-[a-zA-Z0-9]+|db-[a-zA-Z0-9]+)', candidate)
+            if db_match:
+                candidate = db_match.group(1).rstrip("/")
+
+            if "/db-" in candidate or candidate.startswith("db-"):
+                full_url = urljoin(base_url + "/", candidate.lstrip("/"))
+                candidates.add(full_url.rstrip("/"))
+
+    for candidate in sorted(candidates):
+        test_url = f"{candidate}/ranges.js"
+        payload = http_get_json(test_url, timeout=10, log_errors=False)
+        if isinstance(payload, dict):
+            return candidate
+
+    return None
+
+
+def discover_tar1090_db_folder(base_url):
+    configured = os.getenv("TAR1090_DB_FOLDER", "").strip()
+    if configured:
+        configured = configured.rstrip("/")
+        payload = http_get_json(f"{configured}/ranges.js", timeout=10, log_errors=False)
+        if isinstance(payload, dict):
+            log.info(f"Using TAR1090_DB_FOLDER from environment: {configured}")
+            return configured
+        log.warning(f"Configured TAR1090_DB_FOLDER did not validate: {configured}")
+
+    html = http_get_text(f"{normalize_base_url(base_url)}/", timeout=10, log_errors=True)
+    if not html:
+        log.warning("Could not fetch tar1090 index HTML for DB folder discovery")
+        return None
+
+    discovered = extract_db_folder_from_html(html, normalize_base_url(base_url))
+    if discovered:
+        log.info(f"Discovered tar1090 DB folder: {discovered}")
+        return discovered
+
+    log.warning("Could not auto-discover tar1090 DB folder from base URL HTML")
+    return None
+
+
+def refresh_tar1090_db_folder():
+    global TAR1090_DB_FOLDER
+    TAR1090_DB_FOLDER = discover_tar1090_db_folder(BASE_URL)
+    get_tar1090_military_ranges.cache_clear()
+    get_tar1090_type_descriptions.cache_clear()
+    get_tar1090_db_record.cache_clear()
+
+
 def get_registration_from_public_api(hex_code):
     if not hex_code:
         return None
@@ -177,26 +286,26 @@ def get_registration_from_public_api(hex_code):
         data = http_get_json(url)
         if data:
             ac_list = data.get("ac", [])
-            if ac_list and isinstance(ac_list, list) and len(ac_list) > 0:
+            if ac_list and isinstance(ac_list, list):
                 reg = ac_list[0].get("r")
                 if reg:
                     log.info(f"Resolved hex {hex_code} to registration '{reg}' via ADSB.one")
                     return str(reg).strip()
-    except Exception as e:
-        log.debug(f"ADSB.one lookup failed for hex {hex_code}: {e}")
+    except Exception as exc:
+        log.debug(f"ADSB.one lookup failed for hex {hex_code}: {exc}")
 
     try:
         url = f"https://opendata.adsb.fi/api/v2/hex/{cleaned_hex}"
         data = http_get_json(url)
         if data:
             ac_list = data.get("ac", [])
-            if ac_list and isinstance(ac_list, list) and len(ac_list) > 0:
+            if ac_list and isinstance(ac_list, list):
                 reg = ac_list[0].get("r")
                 if reg:
                     log.info(f"Resolved hex {hex_code} to registration '{reg}' via ADSB.fi")
                     return str(reg).strip()
-    except Exception as e:
-        log.debug(f"ADSB.fi lookup failed for hex {hex_code}: {e}")
+    except Exception as exc:
+        log.debug(f"ADSB.fi lookup failed for hex {hex_code}: {exc}")
 
     log.warning(f"Could not resolve a registration tail string for hex {hex_code} via public APIs")
     return None
@@ -241,6 +350,9 @@ def parse_tar1090_db_flags(db_flags):
 
 @lru_cache(maxsize=1)
 def get_tar1090_military_ranges():
+    if not TAR1090_DB_FOLDER:
+        return []
+
     ranges_payload = http_get_json(f"{TAR1090_DB_FOLDER}/ranges.js", timeout=10, log_errors=False)
     if not isinstance(ranges_payload, dict):
         return []
@@ -259,6 +371,9 @@ def get_tar1090_military_ranges():
 
 @lru_cache(maxsize=1)
 def get_tar1090_type_descriptions():
+    if not TAR1090_DB_FOLDER:
+        return {}
+
     data = http_get_json(f"{TAR1090_DB_FOLDER}/icao_aircraft_types2.js", timeout=10, log_errors=False)
     return data if isinstance(data, dict) else {}
 
@@ -275,7 +390,7 @@ def get_flags_js_url():
 
 
 _ICAO_RANGE_ENTRY_RE = re.compile(
-    r"start:\s*0x([0-9A-Fa-f]+)\s*,\s*end:\s*0x([0-9A-Fa-f]+)\s*,\s*country:\s*\"([^\"]*)\""
+    r'start:\s*0x([0-9A-Fa-f]+)\s*,\s*end:\s*0x([0-9A-Fa-f]+)\s*,\s*country:\s*"([^"]*)"'
 )
 
 
@@ -306,6 +421,9 @@ def get_tar1090_country_ranges():
 
 @lru_cache(maxsize=256)
 def get_tar1090_db_record(hex_code):
+    if not TAR1090_DB_FOLDER:
+        return None
+
     query_hex = str(hex_code).strip().upper()
     if not query_hex or query_hex.startswith("~"):
         return None
@@ -368,8 +486,8 @@ def get_callsign(aircraft):
 
 
 def get_aircraft_model(aircraft):
-    hex_code = aircraft.get("hex", "")
-    db_record = get_tar1090_db_record(str(hex_code).strip().upper())
+    hex_code = str(aircraft.get("hex", "")).strip().upper()
+    db_record = get_tar1090_db_record(hex_code)
 
     if isinstance(db_record, (list, tuple)) and len(db_record) >= 4 and db_record[3]:
         return str(db_record[3])
@@ -405,8 +523,7 @@ def get_aircraft_country(hex_code):
 
 
 def is_military(aircraft):
-    raw_hex = aircraft.get("hex", "")
-    aircraft_hex = str(raw_hex).strip().lower() if raw_hex else ""
+    aircraft_hex = str(aircraft.get("hex", "")).strip().lower()
     target_hex = str(TEST_HEX).strip().lower()
 
     if target_hex and aircraft_hex == target_hex:
@@ -476,18 +593,18 @@ def query_planespotters_endpoint(url):
         "Accept": "application/json",
     }
     data = http_get_json(url, headers=headers, timeout=5)
-    if data:
-        if data.get("photos") and len(data["photos"]) > 0:
-            photo_data = data["photos"][0]
-            img_src = photo_data.get("thumbnail_large", {}).get("src")
-            photo_link = photo_data.get("link", "https://www.planespotters.net")
-            photographer = photo_data.get("photographer", "Unknown Photographer")
-            return {
-                "image_url": img_src,
-                "photo_page": photo_link,
-                "photographer": photographer,
-            }
-        log.warning(f"Planespotters endpoint returned 0 photos for query: {url}")
+    if data and data.get("photos"):
+        photo_data = data["photos"][0]
+        img_src = photo_data.get("thumbnail_large", {}).get("src")
+        photo_link = photo_data.get("link", "https://www.planespotters.net")
+        photographer = photo_data.get("photographer", "Unknown Photographer")
+        return {
+            "image_url": img_src,
+            "photo_page": photo_link,
+            "photographer": photographer,
+        }
+
+    log.warning(f"Planespotters endpoint returned 0 photos for query: {url}")
     return None
 
 
@@ -550,6 +667,9 @@ def init_rss_feed_file():
 
 
 def start_rss_http_server():
+    if not ENABLE_RSS:
+        return None
+
     normalized_route = RSS_ROUTE if RSS_ROUTE.startswith("/") else f"/{RSS_ROUTE}"
 
     class RSSHandler(BaseHTTPRequestHandler):
@@ -585,52 +705,46 @@ def start_rss_http_server():
 
 
 def write_rss_item(aircraft, registration, photo_details):
-    hex_code = aircraft.get("hex", "")
+    if not ENABLE_RSS:
+        return
+
+    hex_code = str(aircraft.get("hex", "")).strip().upper()
     flight_link = f"{BASE_URL}/?icao={hex_code}" if hex_code else BASE_URL
 
     callsign = get_callsign(aircraft)
-    display_reg = callsign or registration or str(hex_code).upper()
+    display_reg = callsign or registration or hex_code
 
     photo_url = photo_details.get("image_url") if photo_details else None
-
     attribution_text = ""
     if photo_details:
         p_name = photo_details.get("photographer")
         p_url = photo_details.get("photo_page")
-        attribution_text = f"\n\n*Photo by [{p_name}]({p_url}) via Planespotters.net*"
+        attribution_text = f"\nPhoto by {p_name} via {p_url}"
 
-    is_test = str(hex_code).strip().lower() == str(TEST_HEX).strip().lower()
-
+    is_test = hex_code.lower() == str(TEST_HEX).strip().lower()
     model = get_aircraft_model(aircraft)
     altitude = aircraft.get("alt_baro", aircraft.get("alt_geom", "Unknown Altitude"))
     country = get_aircraft_country(hex_code) or "Unknown"
 
     tree, _, channel = load_or_create_rss_channel()
 
+    title_text = f"Military Plane Detected: {display_reg}"
     if is_test:
-        title_text = f"Military Plane Detected: {display_reg} (TESTING)"
-        description_text = (
-            f"Model: {model} (TESTING)\n"
-            f"Altitude: {altitude} ft (TESTING)\n"
-            f"Country of Registration: {country} (TESTING)\n"
-            f"Flight Link: {flight_link}"
-        )
-    else:
-        title_text = f"Military Plane Detected: {display_reg}"
-        description_text = (
-            f"Model: {model}\n"
-            f"Altitude: {altitude} ft\n"
-            f"Country of Registration: {country}\n"
-            f"Flight Link: {flight_link}"
-        )
+        title_text += " (TESTING)"
 
+    description_text = (
+        f"Model: {model}\n"
+        f"Altitude: {altitude} ft\n"
+        f"Country of Registration: {country}\n"
+        f"Flight Link: {flight_link}"
+    )
     if attribution_text:
-        description_text += attribution_text.replace("\n\n", "\n")
+        description_text += attribution_text
 
     item = ET.SubElement(channel, "item")
     ET.SubElement(item, "title").text = title_text
     ET.SubElement(item, "link").text = flight_link
-    ET.SubElement(item, "guid").text = f"{str(hex_code).lower()}-{int(time.time())}"
+    ET.SubElement(item, "guid").text = f"{hex_code.lower()}-{int(time.time())}"
     ET.SubElement(item, "pubDate").text = format_datetime(datetime.now(timezone.utc), usegmt=True)
     ET.SubElement(item, "description").text = description_text
 
@@ -642,52 +756,277 @@ def write_rss_item(aircraft, registration, photo_details):
         for stale_item in existing_items[:-RSS_MAX_ITEMS]:
             channel.remove(stale_item)
 
-    channel.find("lastBuildDate").text = format_datetime(datetime.now(timezone.utc), usegmt=True)
+    last_build = channel.find("lastBuildDate")
+    if last_build is None:
+        last_build = ET.SubElement(channel, "lastBuildDate")
+    last_build.text = format_datetime(datetime.now(timezone.utc), usegmt=True)
 
     RSS_FEED_PATH.parent.mkdir(parents=True, exist_ok=True)
     tree.write(RSS_FEED_PATH, encoding="utf-8", xml_declaration=True)
     log.info(f"RSS item written for hex {hex_code} -> {RSS_FEED_PATH}")
 
 
+def build_matrix_message(aircraft, registration, photo_details):
+    hex_code = str(aircraft.get("hex", "")).strip().upper()
+    flight_link = f"{BASE_URL}/?icao={hex_code}" if hex_code else BASE_URL
+
+    callsign = get_callsign(aircraft)
+    display_reg = callsign or registration or hex_code or "Unknown"
+    model = get_aircraft_model(aircraft)
+    altitude = aircraft.get("alt_baro", aircraft.get("alt_geom", "Unknown"))
+    country = get_aircraft_country(hex_code) or "Unknown"
+    is_test = hex_code.lower() == str(TEST_HEX).strip().lower()
+
+    title = f"Military Plane Detected: {display_reg}"
+    if is_test:
+        title += " (TESTING)"
+
+    photo_url = photo_details.get("image_url") if photo_details else None
+    photo_page = photo_details.get("photo_page") if photo_details else None
+    photographer = photo_details.get("photographer") if photo_details else None
+
+    text_lines = [
+        title,
+        f"Hex: {hex_code}",
+        f"Registration/Callsign: {display_reg}",
+        f"Model: {model}",
+        f"Altitude: {altitude} ft",
+        f"Country of Registration: {country}",
+        f"Track: {flight_link}",
+    ]
+
+    if photo_page:
+        text_lines.append(f"Photo page: {photo_page}")
+    if photographer:
+        text_lines.append(f"Photographer: {photographer}")
+    if photo_url:
+        text_lines.append(f"Source image: {photo_url}")
+
+    text_body = "\n".join(text_lines)
+
+    html_parts = [
+        f"✈️ <strong>{escape(title)}</strong><br>",
+        f"<strong>Hex:</strong> <code>{escape(hex_code)}</code><br>",
+        f"<strong>Registration/Callsign:</strong> {escape(str(display_reg))}<br>",
+        f"<strong>Model:</strong> {escape(str(model))}<br>",
+        f"<strong>Altitude:</strong> {escape(str(altitude))} ft<br>",
+        f"<strong>Country of Registration:</strong> {escape(str(country))}<br>",
+        f'<strong>Track:</strong> <a href="{escape(flight_link, quote=True)}">{escape(flight_link)}</a>',
+    ]
+
+    if photo_page:
+        html_parts.append(
+            f'<br><strong>Photo page:</strong> <a href="{escape(photo_page, quote=True)}">{escape(photo_page)}</a>'
+        )
+    if photographer:
+        html_parts.append(f"<br><strong>Photographer:</strong> {escape(str(photographer))}")
+
+    return text_body, "".join(html_parts)
+
+
+def send_matrix_event(event_type, content):
+    if not ENABLE_MATRIX:
+        return False
+
+    if not MATRIX_HOMESERVER or not MATRIX_ACCESS_TOKEN or not MATRIX_ROOM_ID:
+        log.warning("Matrix not fully configured; skipping event send")
+        return False
+
+    txn_id = str(int(time.time() * 1000))
+    room_id = quote(MATRIX_ROOM_ID, safe="")
+    url = f"{MATRIX_HOMESERVER}/_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}"
+
+    matrix_ssl_context = build_ssl_context(disable_verify=MATRIX_DISABLE_TLS_VERIFY)
+
+    try:
+        request = Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {MATRIX_ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            data=json.dumps(content).encode("utf-8"),
+            method="PUT",
+        )
+
+        with get_http_opener(ssl_context=matrix_ssl_context).open(request, timeout=15) as response:
+            response.read()
+            return 200 <= getattr(response, "status", 200) < 300
+
+    except HTTPError as exc:
+        try:
+            details = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            details = "<no body>"
+        log.error(f"Matrix event send HTTP error {exc.code}: {details}")
+    except URLError as exc:
+        log.error(f"Matrix event send connection error: {exc}")
+    except Exception as exc:
+        log.error(f"Unexpected Matrix event send error: {exc}")
+
+    return False
+
+
+def send_matrix_message(text_body, formatted_body=None):
+    payload = {
+        "msgtype": "m.text",
+        "body": text_body,
+    }
+
+    if formatted_body and MATRIX_MESSAGE_TYPE == "html":
+        payload["format"] = "org.matrix.custom.html"
+        payload["formatted_body"] = formatted_body
+
+    ok = send_matrix_event("m.room.message", payload)
+    if ok:
+        log.info(f"Matrix text message sent successfully to room {MATRIX_ROOM_ID}")
+    return ok
+
+
+def upload_matrix_media(file_bytes, content_type, filename):
+    if not ENABLE_MATRIX:
+        return None
+
+    if not MATRIX_HOMESERVER or not MATRIX_ACCESS_TOKEN:
+        log.warning("Matrix not fully configured; skipping media upload")
+        return None
+
+    matrix_ssl_context = build_ssl_context(disable_verify=MATRIX_DISABLE_TLS_VERIFY)
+    upload_url = f"{MATRIX_HOMESERVER}/_matrix/media/v3/upload?filename={quote(filename)}"
+
+    try:
+        request = Request(
+            upload_url,
+            headers={
+                "Authorization": f"Bearer {MATRIX_ACCESS_TOKEN}",
+                "Content-Type": content_type,
+            },
+            data=file_bytes,
+            method="POST",
+        )
+
+        with get_http_opener(ssl_context=matrix_ssl_context).open(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            content_uri = payload.get("content_uri")
+            if content_uri:
+                log.info(f"Uploaded media to Matrix: {content_uri}")
+                return content_uri
+            log.warning("Matrix media upload succeeded but no content_uri was returned")
+    except HTTPError as exc:
+        try:
+            details = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            details = "<no body>"
+        log.error(f"Matrix media upload HTTP error {exc.code}: {details}")
+    except URLError as exc:
+        log.error(f"Matrix media upload connection error: {exc}")
+    except Exception as exc:
+        log.error(f"Unexpected Matrix media upload error: {exc}")
+
+    return None
+
+
+def send_matrix_image(image_url, caption=None):
+    image_data = http_get_bytes(
+        image_url,
+        headers={"User-Agent": USER_AGENT_STRING},
+        timeout=15,
+        log_errors=True,
+    )
+    if not image_data:
+        return False
+
+    content_type = image_data.get("content_type", "image/jpeg").split(";")[0].strip()
+    file_bytes = image_data["content"]
+
+    extension = ".jpg"
+    if content_type == "image/png":
+        extension = ".png"
+    elif content_type == "image/webp":
+        extension = ".webp"
+    elif content_type == "image/gif":
+        extension = ".gif"
+
+    filename = f"aircraft{extension}"
+    mxc_uri = upload_matrix_media(file_bytes, content_type, filename)
+    if not mxc_uri:
+        return False
+
+    payload = {
+        "msgtype": "m.image",
+        "body": caption or filename,
+        "url": mxc_uri,
+        "info": {
+            "mimetype": content_type,
+            "size": image_data.get("content_length", len(file_bytes)),
+        },
+    }
+
+    ok = send_matrix_event("m.room.message", payload)
+    if ok:
+        log.info(f"Matrix image sent successfully to room {MATRIX_ROOM_ID}")
+    return ok
+
+
+def emit_detection(aircraft, registration, photo_details):
+    text_body, formatted_body = build_matrix_message(aircraft, registration, photo_details)
+
+    photo_url = photo_details.get("image_url") if photo_details else None
+    display_name = get_callsign(aircraft) or registration or str(aircraft.get("hex", "")).strip().upper() or "Unknown"
+
+    if photo_url:
+        send_matrix_image(photo_url, caption=f"Aircraft photo: {display_name}")
+
+    send_matrix_message(text_body, formatted_body)
+    write_rss_item(aircraft, registration, photo_details)
+
+
 def main():
-    init_rss_feed_file()
-    start_rss_http_server()
+    refresh_tar1090_db_folder()
+
+    if ENABLE_RSS:
+        init_rss_feed_file()
+        start_rss_http_server()
+
     log.info("Starting military aircraft tracker...")
+
     while True:
         current_time = time.time()
 
         expired_keys = [k for k, exp_time in tracked_aircraft_cache.items() if current_time > exp_time]
-        for k in expired_keys:
-            del tracked_aircraft_cache[k]
-            log.info(f"Hex {k} has been out of range for over 10 minutes. Cache cleared.")
+        for key in expired_keys:
+            del tracked_aircraft_cache[key]
+            log.info(f"Hex {key} has been out of range for over {COOLDOWN_WINDOW} seconds. Cache cleared.")
 
         try:
             data = http_get_json(TAR1090_URL, timeout=10)
             if not data:
+                time.sleep(CHECK_INTERVAL)
                 continue
 
             aircraft_list = data.get("aircraft", [])
 
             for aircraft in aircraft_list:
                 hex_code = aircraft.get("hex")
-
                 if not hex_code:
                     continue
 
+                normalized_hex = str(hex_code).strip().upper()
+
                 if not is_adsb_tracked(aircraft):
-                    log.debug(f"Skipping non-ADS-B aircraft: {hex_code}")
+                    log.debug(f"Skipping non-ADS-B aircraft: {normalized_hex}")
                     continue
 
                 if is_military(aircraft):
-                    if hex_code not in tracked_aircraft_cache:
-                        initial_reg = aircraft.get("r") or get_registration_from_tar1090_db(hex_code) or "Unknown"
-                        photo_details, resolved_reg = get_aircraft_photo(hex_code, initial_reg)
-                        write_rss_item(aircraft, resolved_reg, photo_details)
+                    if normalized_hex not in tracked_aircraft_cache:
+                        initial_reg = aircraft.get("r") or get_registration_from_tar1090_db(normalized_hex) or "Unknown"
+                        photo_details, resolved_reg = get_aircraft_photo(normalized_hex, initial_reg)
+                        emit_detection(aircraft, resolved_reg, photo_details)
 
-                    tracked_aircraft_cache[hex_code] = current_time + COOLDOWN_WINDOW
+                    tracked_aircraft_cache[normalized_hex] = current_time + COOLDOWN_WINDOW
 
-        except Exception as e:
-            log.error(f"Error fetching data from tar1090: {e}")
+        except Exception as exc:
+            log.error(f"Error fetching data from tar1090: {exc}")
 
         time.sleep(CHECK_INTERVAL)
 
